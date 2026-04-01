@@ -908,28 +908,32 @@ class EncoderThread(QThread):
         for gpio in (ENC_CLK_GPIO, ENC_DT_GPIO, ENC_SW_GPIO):
             _gpio_export(gpio)
         last_clk = _gpio_read(ENC_CLK_GPIO)
+
         while self._running:
-            clk = _gpio_read(ENC_CLK_GPIO)
-            dt  = _gpio_read(ENC_DT_GPIO)
+            # Batch 25 reads at 2ms each = ~50ms per cycle.
+            # Using time.sleep instead of QThread.msleep to prevent Qt event
+            # queue flooding which causes mouse lag and slow UI repaints.
+            for _ in range(25):
+                clk = _gpio_read(ENC_CLK_GPIO)
+                dt  = _gpio_read(ENC_DT_GPIO)
+                if clk != last_clk:
+                    with self._lock:
+                        self._count += 1 if dt != clk else -1
+                        self._moving = True
+                last_clk = clk
+                time.sleep(0.002)
+
+            # SW Button debounce (checked once per batch)
             sw  = _gpio_read(ENC_SW_GPIO)
-            if clk != last_clk:
-                with self._lock:
-                    if dt != clk:
-                        self._count += 1
-                    else:
-                        self._count -= 1
-                    self._moving = True
-            else:
-                with self._lock:
-                    self._moving = False
-            last_clk = clk
             now = time.time()
             if sw == 0 and self._last_sw == 1:
                 if (now - self._sw_time) * 1000 > self._DEBOUNCE_MS:
                     self._sw_time = now
                     self.sw_pressed.emit()
             self._last_sw = sw
-            self.msleep(1)
+
+            with self._lock:
+                self._moving = False
 
     def _run_sim(self):
         while self._running:
@@ -1774,40 +1778,42 @@ class MetricCard(QFrame):
         lay.addWidget(self._alert)
 
         self._apply_badge("NOMINAL", color)
-        self._apply_val_style(color)
+        self._apply_val_style(Qt.black)
+        self._apply_title_style(Qt.black)
         self._apply_unit_style()
         self.setStyleSheet(
             "QFrame#Card{{ background:#FFFFFF; border:1px solid #DDE3EA;"
             " border-left:4px solid {}; border-radius:10px;}}".format(color))
 
-    def _apply_badge(self, text, color):
-        _BG_MAP = {
-            "#1B8A4C": ("#D4EDDA", "#1B8A4C"),
-            "#1565C0": ("#D0E4F7", "#1565C0"),
-            "#C06000": ("#FFE8C0", "#944800"),
-            "#5E35B1": ("#E0D4F5", "#5E35B1"),
-            "#C62828": ("#FDDEDE", "#C62828"),
-            "#E65100": ("#FFE0CC", "#C04000"),
-        }
-        bg, fg = _BG_MAP.get(color, ("#E8E8E8", "#333333"))
-        self._badge.setText(text)
-        self._badge.setStyleSheet(
-            "color:{fg}; background:{bg}; border:1.5px solid {fg};"
-            " border-radius:4px; padding:3px 10px;"
-            " font-family:'Courier New',monospace;"
-            " font-size:9pt; font-weight:bold; letter-spacing:1px;".format(fg=fg, bg=bg))
+    def _apply_title_style(self, color_name_or_qt):
+        # Using shadow for outline effect
+        from PyQt5.QtWidgets import QGraphicsDropShadowEffect
+        fx = QGraphicsDropShadowEffect(self._title)
+        fx.setBlurRadius(0)
+        fx.setOffset(1, 1)
+        fx.setColor(QColor("#E2E8F0")) # Light grey outline for black text
+        self._title.setGraphicsEffect(fx)
+        
+        self._title.setStyleSheet(
+            "background: transparent; border: none; color: black;"
+            " font-family: 'Liberation Sans',sans-serif;"
+            " font-size: 11pt; font-weight: 800; letter-spacing: 2px;")
 
-    def _apply_unit_style(self):
-        self._unit.setStyleSheet(
-            "QLabel#UnitLbl { color: #8A94A6; background: transparent; border: none;"
-            " font-family: 'Courier New', monospace; font-size: 13pt; font-weight: 500;"
-            " letter-spacing: 1px; padding-bottom: 14px; }")
+    def _apply_val_style(self, color, outline_color=None):
+        from PyQt5.QtWidgets import QGraphicsDropShadowEffect
+        fx = QGraphicsDropShadowEffect(self._val)
+        fx.setBlurRadius(0)
+        fx.setOffset(1, 1)
+        if outline_color:
+            fx.setColor(QColor(outline_color))
+        else:
+            fx.setColor(QColor("#CBD5E0")) # Default subtle outline
+        self._val.setGraphicsEffect(fx)
 
-    def _apply_val_style(self, color):
         self._val.setStyleSheet(
-            "color:{}; background:transparent; border:none;"
+            "color:black; background:transparent; border:none;"
             " font-family:'Liberation Sans',sans-serif;"
-            " font-size:84pt; font-weight:700; letter-spacing:-3px;".format(color))
+            " font-size:84pt; font-weight:800; letter-spacing:-3px;")
 
     def refresh(self, val):
         self._val.setText(str(val))
@@ -1816,26 +1822,27 @@ class MetricCard(QFrame):
             dev = abs(float(val) - _GAUGE_BASE)
         else:
             dev = abs(float(val))
+        
         if alarm is not None and dev >= alarm:
-            vc  = RED
+            outline = RED
             txt = "[!]  ALARM"
-            bg  = ("QFrame#Card{{background:#FFEBEE; border:1px solid #DDE3EA;"
-                   " border-left:4px solid {}; border-radius:10px;}}").format(RED)
+            bg  = ("QFrame#Card{{background:#FFF5F5; border:2px solid {r};"
+                   " border-left:6px solid {r}; border-radius:10px;}}").format(r=RED)
             self._apply_badge("ALARM", RED)
+            self._apply_val_style(Qt.black, RED) # RED outline on alarm
         elif warn is not None and dev >= warn:
-            vc  = WARN
             txt = "^  WARN"
-            bg  = ("QFrame#Card{{background:#FFF3E0; border:1px solid #DDE3EA;"
+            bg  = ("QFrame#Card{{background:#FFFAF0; border:1px solid #DDE3EA;"
                    " border-left:4px solid {}; border-radius:10px;}}").format(WARN)
             self._apply_badge("MONITOR", WARN)
+            self._apply_val_style(Qt.black)
         else:
-            vc  = self.color
             txt = ""
             bg  = ("QFrame#Card{{background:#FFFFFF; border:1px solid #DDE3EA;"
                    " border-left:4px solid {}; border-radius:10px;}}").format(self.color)
             self._apply_badge("NOMINAL", self.color)
-        self._apply_val_style(vc)
-        self._apply_unit_style()
+            self._apply_val_style(Qt.black)
+            
         self._alert.setText(txt)
         self.setStyleSheet(bg)
 
@@ -3225,23 +3232,23 @@ class DashboardPage(QWidget):
         self._view_btn.setStyleSheet(self._ss_action(MAGI))
         self._view_btn.clicked.connect(self.sig_view)
 
-        vsep = QFrame(); vsep.setFixedSize(1, 40)
+        vsep = QFrame(); vsep.setFixedSize(1, 60)
         vsep.setStyleSheet("background:#DDE3EA; border:none;")
 
-        self._toggle = QPushButton("> START")
-        self._toggle.setFixedHeight(58)
-        self._toggle.setMinimumWidth(120)
-        self._toggle.setStyleSheet(self._ss_start())
+        # Circular Combined Toggle Button
+        self._toggle = QPushButton("START")
+        self._toggle.setFixedSize(100, 100)
+        self._toggle.setStyleSheet(self._ss_circle(NEON))
         self._toggle.clicked.connect(self._do_toggle)
 
-        self._pause_btn = QPushButton("|| PAUSE")
-        self._pause_btn.setFixedHeight(58)
-        self._pause_btn.setMinimumWidth(120)
-        self._pause_btn.setStyleSheet(self._ss_pause())
+        # Circular Combined Pause Button
+        self._pause_btn = QPushButton("PAUSE")
+        self._pause_btn.setFixedSize(80, 80)
+        self._pause_btn.setStyleSheet(self._ss_circle(AMBER))
         self._pause_btn.setEnabled(False)
         self._pause_btn.clicked.connect(self._do_pause)
 
-        vsep2 = QFrame(); vsep2.setFixedSize(1, 40)
+        vsep2 = QFrame(); vsep2.setFixedSize(1, 60)
         vsep2.setStyleSheet("background:#DDE3EA; border:none;")
 
         self._entry_btn = QPushButton("DATA ENTRY")
@@ -3275,35 +3282,25 @@ class DashboardPage(QWidget):
         bot.addStretch()
         lay.addLayout(bot)
 
-    def _ss_action(self, color):
-        bg_map = {CYAN: CYAN_LT, AMBER: AMBER_LT, MAGI: MAGI_LT}
-        bg = bg_map.get(color, "#F0F0F0")
+    def _ss_circle(self, color):
         return (
-            "QPushButton{{ background:{bg}; border:2px solid {c};"
-            " border-radius:8px; color:{c};"
+            "QPushButton{{ background:{c}; border:4px solid white;"
+            " border-radius:50px; color:#FFFFFF;"
             " font-family:'Liberation Sans',sans-serif;"
-            " font-size:11pt; font-weight:bold; padding:0px 14px;}}"
-            "QPushButton:pressed{{ background:{c}; color:#FFFFFF; border:2px solid {c};}}"
-            "QPushButton:disabled{{ background:#EEF0F3; border-color:#C8D0DA; color:#B0BAC8;}}"
-        ).format(c=color, bg=bg)
+            " font-size:12pt; font-weight:900; }}"
+            "QPushButton:pressed{{ background:#444; }}"
+            "QPushButton:disabled{{ background:#EEF0F3; color:#B0BAC8; border-color:#C8D0DA; }}"
+        ).format(c=color)
 
-    def _ss_start(self):
+    def _ss_circle_small(self, color):
         return (
-            "QPushButton{{ background:{c}; border:2px solid {c};"
-            " border-radius:8px; color:#FFFFFF;"
+            "QPushButton{{ background:{c}; border:3px solid white;"
+            " border-radius:40px; color:#FFFFFF;"
             " font-family:'Liberation Sans',sans-serif;"
-            " font-size:13pt; font-weight:bold; padding:0px 18px;}}"
-            "QPushButton:pressed{{ background:#145E35; border-color:#145E35; }}"
-        ).format(c=NEON)
-
-    def _ss_stop(self):
-        return (
-            "QPushButton{{ background:{c}; border:2px solid {c};"
-            " border-radius:8px; color:#FFFFFF;"
-            " font-family:'Liberation Sans',sans-serif;"
-            " font-size:13pt; font-weight:bold; padding:0px 18px;}}"
-            "QPushButton:pressed{{ background:#8B1A1A; border-color:#8B1A1A; }}"
-        ).format(c=RED)
+            " font-size:10pt; font-weight:800; }}"
+            "QPushButton:pressed{{ background:#444; }}"
+            "QPushButton:disabled{{ background:#EEF0F3; color:#B0BAC8; border-color:#C8D0DA; }}"
+        ).format(c=color)
 
     def _ss_pause(self):
         return (
@@ -3327,35 +3324,35 @@ class DashboardPage(QWidget):
     def _do_toggle(self):
         self._running = not self._running
         if self._running:
-            self._toggle.setText("[S] STOP")
-            self._toggle.setStyleSheet(self._ss_stop())
+            self._toggle.setText("STOP")
+            self._toggle.setStyleSheet(self._ss_circle(RED))
             self._entry_btn.setEnabled(False)
             self._cal_btn.setEnabled(False)
             self._csv_btn.setEnabled(False)
             self._pause_btn.setEnabled(True)
             self._paused = False
-            self._pause_btn.setText("|| PAUSE")
-            self._pause_btn.setStyleSheet(self._ss_pause())
+            self._pause_btn.setText("PAUSE")
+            self._pause_btn.setStyleSheet(self._ss_circle_small(AMBER))
         else:
-            self._toggle.setText("> START")
-            self._toggle.setStyleSheet(self._ss_start())
+            self._toggle.setText("START")
+            self._toggle.setStyleSheet(self._ss_circle(NEON))
             self._entry_btn.setEnabled(True)
             self._cal_btn.setEnabled(True)
             self._csv_btn.setEnabled(True)
             self._pause_btn.setEnabled(False)
             self._paused = False
-            self._pause_btn.setText("|| PAUSE")
-            self._pause_btn.setStyleSheet(self._ss_pause())
+            self._pause_btn.setText("PAUSE")
+            self._pause_btn.setStyleSheet(self._ss_circle_small(AMBER))
         self.sig_toggle.emit(self._running)
 
     def _do_pause(self):
         self._paused = not self._paused
         if self._paused:
-            self._pause_btn.setText("> RESUME")
-            self._pause_btn.setStyleSheet(self._ss_resume())
+            self._pause_btn.setText("RESUME")
+            self._pause_btn.setStyleSheet(self._ss_circle_small(CYAN))
         else:
-            self._pause_btn.setText("|| PAUSE")
-            self._pause_btn.setStyleSheet(self._ss_pause())
+            self._pause_btn.setText("PAUSE")
+            self._pause_btn.setStyleSheet(self._ss_circle_small(AMBER))
         self.sig_pause.emit(self._paused)
 
     def update_data(self, d):
@@ -3435,11 +3432,6 @@ class TrackApp(QWidget):
         # TopBar: ISO painted status bar (railgui25)
         self.topbar  = TopBar(self)
 
-        # ControlBar: mark / calibrate / CSV path (test.py)
-        self.ctrlbar = ControlBar(self.cfg, self)
-        self.ctrlbar.sig_cal.connect(lambda: self._goto(1))
-        self.ctrlbar.sig_mark.connect(self._on_mark)
-
         self.stack = QStackedWidget()
 
         # Dashboard (railgui25 ISO style + test.py signal routing)
@@ -3475,7 +3467,6 @@ class TrackApp(QWidget):
         self.stack.addWidget(self.csv_viewer) # 4
 
         root.addWidget(self.topbar)
-        root.addWidget(self.ctrlbar)
         root.addWidget(self.stack, 1)
 
         self.dash.set_csv_label(self.cfg["csv_dir"])
@@ -3588,7 +3579,6 @@ class TrackApp(QWidget):
             self.cfg["csv_dir"] = d
             save_cfg(self.cfg)
             self.dash.set_csv_label(d)
-            self.ctrlbar.set_csv_path(d)
             self.csv_viewer.set_csv_dir(d)
 
     def _show_graph(self, key):
@@ -3612,13 +3602,14 @@ def main():
     if not os.environ.get("DISPLAY", ""):
         os.environ.setdefault("QT_QPA_PLATFORM", "linuxfb")
 
-    app = QApplication(sys.argv)
-    app.setApplicationName("Rail Inspection Unit")
-
+    # FIX: Qt::AA_EnableHighDpiScaling must be set BEFORE QCoreApplication is created.
     try:
-        app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     except AttributeError:
         pass
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("Rail Inspection Unit")
 
     try:
         app.restoreOverrideCursor()
