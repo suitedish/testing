@@ -1,0 +1,16 @@
+[Unit]
+Description=Rail Inspection Trolley GUI
+After=network.target xorg.service
+
+[Service]
+Type=simple
+User=debian
+WorkingDirectory=/home/debian/testing
+Environment=DISPLAY=:0
+Environment=QT_QPA_PLATFORM=xcb
+ExecStart=/usr/bin/python3 /home/debian/testing/integrated_rail.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target
