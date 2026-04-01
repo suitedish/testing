@@ -281,8 +281,11 @@ def _gpio_export(num):
             pass
 
 
-def _gpio_read(num):
+def _gpio_read(num, handle=None):
     try:
+        if handle:
+            handle.seek(0)
+            return int(handle.read().strip())
         with open("{}/gpio{}/value".format(_GPIO_BASE, num)) as f:
             return int(f.read().strip())
     except Exception:
@@ -907,24 +910,32 @@ class EncoderThread(QThread):
     def _run_hw(self):
         for gpio in (ENC_CLK_GPIO, ENC_DT_GPIO, ENC_SW_GPIO):
             _gpio_export(gpio)
-        last_clk = _gpio_read(ENC_CLK_GPIO)
+        
+        try:
+            f_clk = open("{}/gpio{}/value".format(_GPIO_BASE, ENC_CLK_GPIO), "r")
+            f_dt  = open("{}/gpio{}/value".format(_GPIO_BASE, ENC_DT_GPIO), "r")
+            f_sw  = open("{}/gpio{}/value".format(_GPIO_BASE, ENC_SW_GPIO), "r")
+        except Exception:
+            return
+
+        last_clk = _gpio_read(ENC_CLK_GPIO, f_clk)
 
         while self._running:
-            # Batch 25 reads at 2ms each = ~50ms per cycle.
-            # Using time.sleep instead of QThread.msleep to prevent Qt event
-            # queue flooding which causes mouse lag and slow UI repaints.
-            for _ in range(25):
-                clk = _gpio_read(ENC_CLK_GPIO)
-                dt  = _gpio_read(ENC_DT_GPIO)
+            # High-speed polling with minimal overhead
+            # We poll frequently to avoid missing pulses, but we don't
+            # flood the event queue with signals.
+            for _ in range(50):
+                clk = _gpio_read(ENC_CLK_GPIO, f_clk)
+                dt  = _gpio_read(ENC_DT_GPIO, f_dt)
                 if clk != last_clk:
                     with self._lock:
                         self._count += 1 if dt != clk else -1
                         self._moving = True
                 last_clk = clk
-                time.sleep(0.002)
+                time.sleep(0.001) # 1ms precision for encoder
 
             # SW Button debounce (checked once per batch)
-            sw  = _gpio_read(ENC_SW_GPIO)
+            sw  = _gpio_read(ENC_SW_GPIO, f_sw)
             now = time.time()
             if sw == 0 and self._last_sw == 1:
                 if (now - self._sw_time) * 1000 > self._DEBOUNCE_MS:
@@ -934,6 +945,8 @@ class EncoderThread(QThread):
 
             with self._lock:
                 self._moving = False
+        
+        f_clk.close(); f_dt.close(); f_sw.close()
 
     def _run_sim(self):
         while self._running:
@@ -1008,7 +1021,14 @@ class SensorThread(QThread):
 
         while True:
             try:
-                d = self._sample()
+                if HW_SIM:
+                    # In simulation mode, use the realistic IR emulator
+                    dist_m = self._encoder.distance_m()
+                    self._mock_gps(dist_m, self._speed_kmh)
+                    d = self._sim_sample(dist_m)
+                else:
+                    # In hardware mode, sample actual sensors
+                    d = self._sample()
                 self.data_ready.emit(d)
             except Exception as exc:
                 self.fault.emit(str(exc))
@@ -1148,6 +1168,23 @@ class SensorThread(QThread):
         self._lon       = round(self._origin_lon + d_lon, 7)
         self._speed_kmh = speed_kmh
         self._gps_active = True
+
+    def _sim_sample(self, dist_m):
+        # Realistic Indian Railways Broad Gauge (1676mm nominal)
+        # We add a slight random walk to simulate track geometry variation
+        g_noise = random.gauss(0, 0.2)
+        c_noise = random.gauss(0, 0.5)
+        t_noise = abs(random.gauss(0.15, 0.05))
+        
+        return {
+            "gauge": round(self._GAUGE_STD + g_noise, 1),
+            "cross": round(0.0 + c_noise, 2),
+            "twist": round(t_noise, 2),
+            "dist" : round(dist_m, 3),
+            "lat"  : self._lat,
+            "lon"  : self._lon,
+            "speed": round(self._speed_kmh or random.uniform(5.0, 12.0), 1),
+        }
 
     def _parse_nmea(self, sentence):
         try:
@@ -1673,7 +1710,7 @@ class ControlBar(QWidget):
         lay.addWidget(mark)
 
     def set_csv_path(self, path):
-        self._csv_lbl.setText("[DIR]  " + _shorten(path))
+        self._csv_lbl.setText("CSV FOLDER:  " + _shorten(path))
 
 
 # =============================================================================
@@ -1757,7 +1794,6 @@ class MetricCard(QFrame):
         self._unit.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
         self._unit.setFixedWidth(68)
         self._unit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        self._apply_unit_style()
 
         pair_l.addWidget(self._val)
         pair_l.addWidget(self._unit)
@@ -1785,35 +1821,52 @@ class MetricCard(QFrame):
             "QFrame#Card{{ background:#FFFFFF; border:1px solid #DDE3EA;"
             " border-left:4px solid {}; border-radius:10px;}}".format(color))
 
+    def _apply_badge(self, text, color):
+        _BG_MAP = {
+            "#1B8A4C": ("#D4EDDA", "#1B8A4C"),
+            "#1565C0": ("#D0E4F7", "#1565C0"),
+            "#C06000": ("#FFE8C0", "#944800"),
+            "#5E35B1": ("#E0D4F5", "#5E35B1"),
+            "#C62828": ("#FDDEDE", "#C62828"),
+            "#E65100": ("#FFE0CC", "#C04000"),
+        }
+        bg, fg = _BG_MAP.get(color, ("#E8E8E8", "#333333"))
+        self._badge.setText(text)
+        self._badge.setStyleSheet(
+            "color:{fg}; background:{bg}; border:1.5px solid {fg};"
+            " border-radius:4px; padding:3px 10px;"
+            " font-family:'Courier New',monospace;"
+            " font-size:9pt; font-weight:bold; letter-spacing:1px;".format(fg=fg, bg=bg))
+
+    def _apply_unit_style(self):
+        self._unit.setStyleSheet(
+            "QLabel#UnitLbl { color: #8A94A6; background: transparent; border: none;"
+            " font-family: 'Courier New', monospace; font-size: 13pt; font-weight: 500;"
+            " letter-spacing: 1px; padding-bottom: 14px; }")
+
     def _apply_title_style(self, color_name_or_qt):
-        # Using shadow for outline effect
-        from PyQt5.QtWidgets import QGraphicsDropShadowEffect
-        fx = QGraphicsDropShadowEffect(self._title)
-        fx.setBlurRadius(0)
-        fx.setOffset(1, 1)
-        fx.setColor(QColor("#E2E8F0")) # Light grey outline for black text
-        self._title.setGraphicsEffect(fx)
-        
+        # Industrial Outlined Bold Title
         self._title.setStyleSheet(
             "background: transparent; border: none; color: black;"
-            " font-family: 'Liberation Sans',sans-serif;"
-            " font-size: 11pt; font-weight: 800; letter-spacing: 2px;")
+            " font-family: 'Liberation Sans', sans-serif;"
+            " font-size: 12pt; font-weight: 900; letter-spacing: 2.5px;")
 
     def _apply_val_style(self, color, outline_color=None):
-        from PyQt5.QtWidgets import QGraphicsDropShadowEffect
-        fx = QGraphicsDropShadowEffect(self._val)
-        fx.setBlurRadius(0)
-        fx.setOffset(1, 1)
-        if outline_color:
-            fx.setColor(QColor(outline_color))
+        # Optimized for performance - only set shadow if it's an alarm
+        if outline_color == RED:
+            from PyQt5.QtWidgets import QGraphicsDropShadowEffect
+            fx = QGraphicsDropShadowEffect(self._val)
+            fx.setBlurRadius(0)
+            fx.setOffset(2, 2)
+            fx.setColor(QColor(RED))
+            self._val.setGraphicsEffect(fx)
         else:
-            fx.setColor(QColor("#CBD5E0")) # Default subtle outline
-        self._val.setGraphicsEffect(fx)
+            self._val.setGraphicsEffect(None)
 
         self._val.setStyleSheet(
-            "color:black; background:transparent; border:none;"
-            " font-family:'Liberation Sans',sans-serif;"
-            " font-size:84pt; font-weight:800; letter-spacing:-3px;")
+            "color: black; background: transparent; border: none;"
+            " font-family: 'Liberation Sans', sans-serif;"
+            " font-size: 84pt; font-weight: 800; letter-spacing: -3px;")
 
     def refresh(self, val):
         self._val.setText(str(val))
@@ -3012,14 +3065,14 @@ class CSVViewerPage(QWidget):
         back = _btn("<- DASHBOARD", "BC", 40, 170)
         back.clicked.connect(self.sig_back)
 
-        title = QLabel("[CLIP]   CSV FILE VIEWER")
+        title = QLabel("CSV FILE VIEWER")
         title.setStyleSheet("color:{}; font-size:13pt; font-weight:bold; letter-spacing:3px;".format(MAGI))
 
         self._file_lbl = QLabel("No file loaded")
         self._file_lbl.setStyleSheet("color:#8A94A6; font-size:8pt; font-family:'Courier New';")
         self._file_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-        browse_btn = _btn("[OPEN]  BROWSE", "BM", 40, 130)
+        browse_btn = _btn("BROWSE", "BM", 40, 130)
         browse_btn.clicked.connect(self._browse)
 
         hdr.addWidget(back)
@@ -3219,14 +3272,14 @@ class DashboardPage(QWidget):
         bot.setSpacing(10)
 
         # CSV folder button
-        self._csv_btn = QPushButton("[DIR]  SELECT CSV FOLDER")
+        self._csv_btn = QPushButton("SELECT CSV FOLDER")
         self._csv_btn.setFixedHeight(52)
         self._csv_btn.setMinimumWidth(200)
         self._csv_btn.setStyleSheet(self._ss_action(CYAN))
         self._csv_btn.clicked.connect(self.sig_csv)
 
         # View CSV button
-        self._view_btn = QPushButton("[CLIP]  VIEW CSV")
+        self._view_btn = QPushButton("VIEW CSV")
         self._view_btn.setFixedHeight(52)
         self._view_btn.setMinimumWidth(130)
         self._view_btn.setStyleSheet(self._ss_action(MAGI))
@@ -3370,7 +3423,7 @@ class DashboardPage(QWidget):
             " font-size:10pt; font-weight:500;".format(col))
 
     def set_csv_label(self, path):
-        self._csv_btn.setText("[DIR]  " + _shorten(path, 20))
+        self._csv_btn.setText("CSV: " + _shorten(path, 20))
 
 
 # =============================================================================
@@ -3599,14 +3652,15 @@ class TrackApp(QWidget):
 
 # =============================================================================
 def main():
-    if not os.environ.get("DISPLAY", ""):
-        os.environ.setdefault("QT_QPA_PLATFORM", "linuxfb")
-
-    # FIX: Qt::AA_EnableHighDpiScaling must be set BEFORE QCoreApplication is created.
+    # Set High DPI attributes BEFORE anything else
     try:
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    except AttributeError:
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    except Exception:
         pass
+
+    if not os.environ.get("DISPLAY", ""):
+        os.environ.setdefault("QT_QPA_PLATFORM", "linuxfb")
 
     app = QApplication(sys.argv)
     app.setApplicationName("Rail Inspection Unit")
