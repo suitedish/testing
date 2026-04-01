@@ -3335,6 +3335,16 @@ class DashboardPage(QWidget):
         bot.addStretch()
         lay.addLayout(bot)
 
+    def _ss_action(self, color):
+        return (
+            "QPushButton{{ background:#FFFFFF; border:2px solid {c};"
+            " border-radius:10px; color:{c};"
+            " font-family:'Liberation Sans',sans-serif;"
+            " font-size:11pt; font-weight:800; letter-spacing:1px; }}"
+            "QPushButton:pressed{{ background:{c}; color:white; }}"
+            "QPushButton:disabled{{ background:#F0F0F0; border-color:#C8D0DA; color:#A0AAB8; }}"
+        ).format(c=color)
+
     def _ss_circle(self, color):
         return (
             "QPushButton{{ background:{c}; border:4px solid white;"
@@ -3649,6 +3659,18 @@ class TrackApp(QWidget):
                 self.resize(SCREEN_W, SCREEN_H)
         super().keyPressEvent(e)
 
+    def closeEvent(self, e):
+        # Gracefully stop threads to avoid "QThread: Destroyed while thread still running"
+        try:
+            self.sensor.active = False
+            self.encoder._running = False
+            self.net.terminate()
+            self.csv_writer.stop_session()
+            time.sleep(0.2)
+        except Exception:
+            pass
+        super().closeEvent(e)
+
 
 # =============================================================================
 def main():
@@ -3661,6 +3683,11 @@ def main():
 
     if not os.environ.get("DISPLAY", ""):
         os.environ.setdefault("QT_QPA_PLATFORM", "linuxfb")
+    
+    # Ensure XDG_RUNTIME_DIR is set for Qt on BBB
+    if not os.environ.get("XDG_RUNTIME_DIR", ""):
+        os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp/runtime-debian")
+        os.makedirs("/tmp/runtime-debian", mode=0o700, exist_ok=True)
 
     app = QApplication(sys.argv)
     app.setApplicationName("Rail Inspection Unit")
