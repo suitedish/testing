@@ -1,16 +1,22 @@
 [Unit]
 Description=Rail Inspection Trolley GUI
-After=network.target xorg.service
+After=network.target graphical.target
 
 [Service]
 Type=simple
 User=debian
-WorkingDirectory=/home/debian/testing
+WorkingDirectory=/home/debian/trolley
 Environment=DISPLAY=:0
-Environment=QT_QPA_PLATFORM=xcb
-ExecStart=/usr/bin/python3 /home/debian/testing/integrated_rail.py
+Environment=XDG_RUNTIME_DIR=/tmp/runtime-debian
+Environment=XAUTHORITY=/home/debian/.Xauthority
+ExecStartPre=/usr/bin/mkdir -p /tmp/runtime-debian
+ExecStartPre=/usr/bin/chmod 700 /tmp/runtime-debian
+# Maximize CPU frequency governor to eliminate frequency-scaling stutter
+ExecStartPre=-/usr/bin/cpufreq-set -g performance
+# Run Python GUI at high priority (nice -n -10)
+ExecStart=/usr/bin/nice -n -10 /usr/bin/python3 /home/debian/trolley/integrated_rail.py
 Restart=always
-RestartSec=5
+RestartSec=10
 
 [Install]
 WantedBy=graphical.target
