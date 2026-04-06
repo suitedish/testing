@@ -285,9 +285,9 @@ def _gpio_read(num, handle=None):
     try:
         if handle:
             handle.seek(0)
-            return int(handle.read().strip())
+            return 1 if handle.read(1) == '1' else 0
         with open("{}/gpio{}/value".format(_GPIO_BASE, num)) as f:
-            return int(f.read().strip())
+            return 1 if f.read(1) == '1' else 0
     except Exception:
         return 1
 
@@ -921,10 +921,8 @@ class EncoderThread(QThread):
         last_clk = _gpio_read(ENC_CLK_GPIO, f_clk)
 
         while self._running:
-            # High-speed polling with minimal overhead
-            # We poll frequently to avoid missing pulses, but we don't
-            # flood the event queue with signals.
-            for _ in range(50):
+            # Poll at 500Hz intervals to balance responsiveness and CPU load
+            for _ in range(25):
                 clk = _gpio_read(ENC_CLK_GPIO, f_clk)
                 dt  = _gpio_read(ENC_DT_GPIO, f_dt)
                 if clk != last_clk:
@@ -932,7 +930,7 @@ class EncoderThread(QThread):
                         self._count += 1 if dt != clk else -1
                         self._moving = True
                 last_clk = clk
-                time.sleep(0.001) # 1ms precision for encoder
+                time.sleep(0.002) # 2ms precision
 
             # SW Button debounce (checked once per batch)
             sw  = _gpio_read(ENC_SW_GPIO, f_sw)
@@ -1160,7 +1158,7 @@ class SensorThread(QThread):
             pass
 
     def _mock_gps(self, dist_m, speed_kmh):
-        import math as _math
+        import math as _math  # noqa: already imported at module; kept for safety
         bearing_rad     = _math.radians(self._GPS_BEARING_DEG)
         d_lat           = dist_m * _math.cos(bearing_rad) / self._m_per_deg_lat
         d_lon           = dist_m * _math.sin(bearing_rad) / self._m_per_deg_lon
@@ -1727,38 +1725,56 @@ _GAUGE_BASE = 1676.0
 
 
 class MetricCard(QFrame):
+    """Performance-optimised metric card.
+
+    Key design rules that MUST be maintained:
+    - NO QGraphicsDropShadowEffect on ANY widget (ARM software compositing is fatal).
+    - Pre-build every stylesheet string in __init__ so refresh() does ZERO string ops.
+    - setStyleSheet / setText on badge/alert ONLY when alarm state changes (rare).
+    - Only self._val.setText() runs every sensor tick (QLabel setText is ~3 µs).
+    """
+
+    _BADGE_COLORS = {
+        "#1B8A4C": ("#D4EDDA", "#1B8A4C"),
+        "#1565C0": ("#D0E4F7", "#1565C0"),
+        "#C06000": ("#FFE8C0", "#944800"),
+        "#5E35B1": ("#E0D4F5", "#5E35B1"),
+        "#C62828": ("#FDDEDE", "#C62828"),
+        "#E65100": ("#FFE0CC", "#C04000"),
+    }
+
     clicked = pyqtSignal(str)
 
     def __init__(self, key, title, unit, color, parent=None):
         super().__init__(parent)
-        self.key   = key
-        self.color = color
+        self.key    = key
+        self.color  = color
+        self._state = "IDLE"   # tracks NOMINAL / WARN / ALARM
+
         self.setObjectName("Card")
         self.setCursor(Qt.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
-        from PyQt5.QtWidgets import QGraphicsDropShadowEffect
-        fx = QGraphicsDropShadowEffect(self)
-        fx.setBlurRadius(16)
-        fx.setOffset(0, 4)
-        fx.setColor(QColor(0, 0, 0, 20))
-        self.setGraphicsEffect(fx)
+        # ── NO QGraphicsDropShadowEffect ─────────────────────────────────────
+        # Software shadow compositing on BBB's ARM CPU costs ~30 ms per repaint.
+        # Use a border-left accent instead — zero rendering cost.
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 6)
         lay.setSpacing(0)
 
-        hdr = QWidget()
+        # ── Header row ───────────────────────────────────────────────────────
+        hdr   = QWidget()
         hdr_l = QHBoxLayout(hdr)
         hdr_l.setContentsMargins(18, 10, 14, 8)
         hdr_l.setSpacing(8)
 
         self._title = QLabel(title.upper())
         self._title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        # Style set once; never touched again.
         self._title.setStyleSheet(
-            "background: transparent; border: none; color: #4A5568;"
-            " font-family: 'Liberation Sans',sans-serif;"
-            " font-size: 11pt; font-weight: 600; letter-spacing: 1.2px;")
+            "background:transparent;border:none;color:#1a1a1a;"
+            "font-family:'Liberation Sans',sans-serif;"
+            "font-size:11pt;font-weight:900;letter-spacing:2px;")
 
         self._badge = QLabel("NOMINAL")
         self._badge.setAlignment(Qt.AlignCenter)
@@ -1768,10 +1784,11 @@ class MetricCard(QFrame):
 
         rule = QFrame()
         rule.setFixedHeight(1)
-        rule.setStyleSheet("background:#DDE3EA; border:none;")
+        rule.setStyleSheet("background:#DDE3EA;border:none;")
 
+        # ── Value row ────────────────────────────────────────────────────────
         val_row_w = QWidget()
-        val_row_w.setStyleSheet("background:transparent; border:none;")
+        val_row_w.setStyleSheet("background:transparent;border:none;")
         val_row_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         outer_l = QHBoxLayout(val_row_w)
         outer_l.setContentsMargins(0, 0, 0, 0)
@@ -1779,21 +1796,30 @@ class MetricCard(QFrame):
         outer_l.addStretch(1)
 
         pair_w = QWidget()
-        pair_w.setStyleSheet("background:transparent; border:none;")
+        pair_w.setStyleSheet("background:transparent;border:none;")
         pair_l = QHBoxLayout(pair_w)
         pair_l.setContentsMargins(0, 0, 0, 0)
         pair_l.setSpacing(6)
 
+        # Plain QLabel — font set ONCE here, never in refresh.
         self._val = QLabel("---")
         self._val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self._val.setMinimumWidth(320)
+        self._val.setMinimumWidth(300)
         self._val.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self._val.setFont(QFont("Liberation Sans", 72, QFont.Black))
+        self._val.setStyleSheet(
+            "color:#1a1a1a;background:transparent;border:none;")
 
         self._unit = QLabel(unit)
         self._unit.setObjectName("UnitLbl")
         self._unit.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
         self._unit.setFixedWidth(68)
         self._unit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        # Style unit once.
+        self._unit.setStyleSheet(
+            "QLabel#UnitLbl{color:#8A94A6;background:transparent;border:none;"
+            "font-family:'Courier New',monospace;font-size:13pt;font-weight:500;"
+            "letter-spacing:1px;padding-bottom:14px;}")
 
         pair_l.addWidget(self._val)
         pair_l.addWidget(self._unit)
@@ -1804,100 +1830,88 @@ class MetricCard(QFrame):
         self._alert.setAlignment(Qt.AlignCenter)
         self._alert.setFixedHeight(22)
         self._alert.setStyleSheet(
-            "color: #C62828; background: transparent; border: none;"
-            " font-family: 'Liberation Sans',sans-serif;"
-            " font-size: 9pt; font-weight: 600; letter-spacing: 0.5px;")
+            "color:#C62828;background:transparent;border:none;"
+            "font-family:'Liberation Sans',sans-serif;"
+            "font-size:9pt;font-weight:600;letter-spacing:0.5px;")
 
         lay.addWidget(hdr)
         lay.addWidget(rule)
         lay.addWidget(val_row_w, 1)
         lay.addWidget(self._alert)
 
-        self._apply_badge("NOMINAL", color)
-        self._apply_val_style(Qt.black)
-        self._apply_title_style(Qt.black)
-        self._apply_unit_style()
-        self.setStyleSheet(
-            "QFrame#Card{{ background:#FFFFFF; border:1px solid #DDE3EA;"
-            " border-left:4px solid {}; border-radius:10px;}}".format(color))
+        # ── Pre-build every stylesheet string ────────────────────────────────
+        # Done HERE so refresh() never does string formatting.
+        _bss = ("color:{fg};background:{bg};border:1.5px solid {fg};"
+                "border-radius:4px;padding:3px 10px;"
+                "font-family:'Courier New',monospace;"
+                "font-size:9pt;font-weight:bold;letter-spacing:1px;")
 
-    def _apply_badge(self, text, color):
-        _BG_MAP = {
-            "#1B8A4C": ("#D4EDDA", "#1B8A4C"),
-            "#1565C0": ("#D0E4F7", "#1565C0"),
-            "#C06000": ("#FFE8C0", "#944800"),
-            "#5E35B1": ("#E0D4F5", "#5E35B1"),
-            "#C62828": ("#FDDEDE", "#C62828"),
-            "#E65100": ("#FFE0CC", "#C04000"),
-        }
-        bg, fg = _BG_MAP.get(color, ("#E8E8E8", "#333333"))
-        self._badge.setText(text)
-        self._badge.setStyleSheet(
-            "color:{fg}; background:{bg}; border:1.5px solid {fg};"
-            " border-radius:4px; padding:3px 10px;"
-            " font-family:'Courier New',monospace;"
-            " font-size:9pt; font-weight:bold; letter-spacing:1px;".format(fg=fg, bg=bg))
+        nb, nf = self._BADGE_COLORS.get(color,  ("#E8E8E8", "#333333"))
+        rb, rf = self._BADGE_COLORS.get(RED,    ("#FDDEDE", "#C62828"))
+        wb, wf = self._BADGE_COLORS.get(WARN,   ("#FFE0CC", "#C04000"))
 
-    def _apply_unit_style(self):
-        self._unit.setStyleSheet(
-            "QLabel#UnitLbl { color: #8A94A6; background: transparent; border: none;"
-            " font-family: 'Courier New', monospace; font-size: 13pt; font-weight: 500;"
-            " letter-spacing: 1px; padding-bottom: 14px; }")
+        self._badge_ss_nominal = _bss.format(fg=nf, bg=nb)
+        self._badge_ss_alarm   = _bss.format(fg=rf, bg=rb)
+        self._badge_ss_warn    = _bss.format(fg=wf, bg=wb)
 
-    def _apply_title_style(self, color_name_or_qt):
-        # Industrial Outlined Bold Title
-        self._title.setStyleSheet(
-            "background: transparent; border: none; color: black;"
-            " font-family: 'Liberation Sans', sans-serif;"
-            " font-size: 12pt; font-weight: 900; letter-spacing: 2.5px;")
+        self._ss_nominal = (
+            "QFrame#Card{{background:#FFFFFF;border:1px solid #DDE3EA;"
+            "border-left:6px solid {c};}}"
+        ).format(c=color)
+        self._ss_warn  = (
+            "QFrame#Card{background:#FFFAF0;border:1px solid #DDE3EA;"
+            "border-left:6px solid " + WARN + ";}")
+        self._ss_alarm = (
+            "QFrame#Card{background:#FFF5F5;border:2px solid " + RED + ";"
+            "border-left:8px solid " + RED + ";}")
 
-    def _apply_val_style(self, color, outline_color=None):
-        # Optimized for performance - only set shadow if it's an alarm
-        if outline_color == RED:
-            from PyQt5.QtWidgets import QGraphicsDropShadowEffect
-            fx = QGraphicsDropShadowEffect(self._val)
-            fx.setBlurRadius(0)
-            fx.setOffset(2, 2)
-            fx.setColor(QColor(RED))
-            self._val.setGraphicsEffect(fx)
-        else:
-            self._val.setGraphicsEffect(None)
+        # Apply initial state
+        self.setStyleSheet(self._ss_nominal)
+        self._badge.setText("NOMINAL")
+        self._badge.setStyleSheet(self._badge_ss_nominal)
 
-        self._val.setStyleSheet(
-            "color: black; background: transparent; border: none;"
-            " font-family: 'Liberation Sans', sans-serif;"
-            " font-size: 84pt; font-weight: 800; letter-spacing: -3px;")
-
+    # ── refresh() is the HOT PATH: called every 500 ms ──────────────────────
     def refresh(self, val):
+        # 1. Update displayed value — QLabel.setText is very fast
         self._val.setText(str(val))
+
+        # 2. Compute deviation
         warn, alarm = _THRESH.get(self.key, (None, None))
-        if self.key == "gauge":
-            dev = abs(float(val) - _GAUGE_BASE)
-        else:
-            dev = abs(float(val))
-        
+        try:
+            fval = float(val)
+        except (ValueError, TypeError):
+            return
+        dev = abs(fval - _GAUGE_BASE) if self.key == "gauge" else abs(fval)
+
+        # 3. Determine new state
         if alarm is not None and dev >= alarm:
-            outline = RED
-            txt = "[!]  ALARM"
-            bg  = ("QFrame#Card{{background:#FFF5F5; border:2px solid {r};"
-                   " border-left:6px solid {r}; border-radius:10px;}}").format(r=RED)
-            self._apply_badge("ALARM", RED)
-            self._apply_val_style(Qt.black, RED) # RED outline on alarm
+            new_state = "ALARM"
         elif warn is not None and dev >= warn:
-            txt = "^  WARN"
-            bg  = ("QFrame#Card{{background:#FFFAF0; border:1px solid #DDE3EA;"
-                   " border-left:4px solid {}; border-radius:10px;}}").format(WARN)
-            self._apply_badge("MONITOR", WARN)
-            self._apply_val_style(Qt.black)
+            new_state = "WARN"
         else:
-            txt = ""
-            bg  = ("QFrame#Card{{background:#FFFFFF; border:1px solid #DDE3EA;"
-                   " border-left:4px solid {}; border-radius:10px;}}").format(self.color)
-            self._apply_badge("NOMINAL", self.color)
-            self._apply_val_style(Qt.black)
-            
-        self._alert.setText(txt)
-        self.setStyleSheet(bg)
+            new_state = "NOMINAL"
+
+        # 4. ONLY update styles when state CHANGES — this is the critical
+        #    optimisation. setStyleSheet() on BBB costs ~5–15 ms.
+        if new_state == self._state:
+            return
+        self._state = new_state
+
+        if new_state == "ALARM":
+            self.setStyleSheet(self._ss_alarm)
+            self._badge.setText("ALARM")
+            self._badge.setStyleSheet(self._badge_ss_alarm)
+            self._alert.setText("[!]  ALARM")
+        elif new_state == "WARN":
+            self.setStyleSheet(self._ss_warn)
+            self._badge.setText("MONITOR")
+            self._badge.setStyleSheet(self._badge_ss_warn)
+            self._alert.setText("^  WARN")
+        else:
+            self.setStyleSheet(self._ss_nominal)
+            self._badge.setText("NOMINAL")
+            self._badge.setStyleSheet(self._badge_ss_nominal)
+            self._alert.setText("")
 
     def mousePressEvent(self, _):
         self.clicked.emit(self.key)
